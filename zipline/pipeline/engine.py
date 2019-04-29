@@ -73,6 +73,7 @@ from zipline.utils.pandas_utils import explode
 
 from .domain import Domain, GENERIC
 from .graph import maybe_specialize
+from .hook import MultiHook
 from .term import AssetExists, InputDates, LoadableTerm
 
 from zipline.utils.date_utils import compute_date_range_chunks
@@ -249,7 +250,8 @@ class SimplePipelineEngine(PipelineEngine):
                  get_loader,
                  asset_finder,
                  default_domain=GENERIC,
-                 populate_initial_workspace=None):
+                 populate_initial_workspace=None,
+                 default_hooks=None):
 
         self._get_loader = get_loader
         self._finder = asset_finder
@@ -262,7 +264,12 @@ class SimplePipelineEngine(PipelineEngine):
         )
         self._default_domain = default_domain
 
-    def run_pipeline(self, pipeline, start_date, end_date):
+        if default_hooks is None:
+            self._default_hooks = []
+        else:
+            self._default_hooks = list(default_hooks)
+
+    def run_pipeline(self, pipeline, start_date, end_date, hooks=None):
         """
         Compute a pipeline.
 
@@ -300,15 +307,20 @@ class SimplePipelineEngine(PipelineEngine):
             raise ValueError(
                 "start_date must be before or equal to end_date \n"
                 "start_date=%s, end_date=%s" % (start_date, end_date)
-
             )
+
+        if hooks is None:
+            hooks = []
+        all_hooks = self._resolve_hooks(hooks)
 
         domain = self.resolve_domain(pipeline)
 
-        graph = pipeline.to_execution_plan(
+        plan = pipeline.to_execution_plan(
             domain, self._root_mask_term, start_date, end_date,
         )
-        extra_rows = graph.extra_rows[self._root_mask_term]
+        eng_hooks.on_create_execution_plan(plan)
+
+        extra_rows = plan.extra_rows[self._root_mask_term]
         root_mask = self._compute_root_mask(
             domain, start_date, end_date, extra_rows,
         )
@@ -320,23 +332,35 @@ class SimplePipelineEngine(PipelineEngine):
                 self._root_mask_dates_term: as_column(dates.values)
             },
             self._root_mask_term,
-            graph,
+            plan,
             dates,
             assets,
         )
 
-        results = self.compute_chunk(graph, dates, assets, initial_workspace)
+        eng_hooks.begin_compute_chunk(
+        results = self.compute_chunk(
+            plan,
+            dates,
+            assets,
+            initial_workspace,
+            eng_hooks,
+        )
 
         return self._to_narrow(
-            graph.outputs,
+            plan.outputs,
             results,
-            results.pop(graph.screen_name),
+            results.pop(plan.screen_name),
             dates[extra_rows:],
             assets,
         )
 
     @copydoc(PipelineEngine.run_chunked_pipeline)
-    def run_chunked_pipeline(self, pipeline, start_date, end_date, chunksize):
+    def run_chunked_pipeline(self,
+                             pipeline,
+                             start_date,
+                             end_date,
+                             chunksize,
+                             hooks=None):
         domain = self.resolve_domain(pipeline)
         ranges = compute_date_range_chunks(
             domain.all_sessions(),
@@ -344,6 +368,11 @@ class SimplePipelineEngine(PipelineEngine):
             end_date,
             chunksize,
         )
+
+        if hooks is None:
+            hooks = []
+        hooks = self._resolve_hooks(hooks)
+
         chunks = [self.run_pipeline(pipeline, s, e) for s, e in ranges]
 
         if len(chunks) == 1:
@@ -768,3 +797,8 @@ class SimplePipelineEngine(PipelineEngine):
             term is self._root_mask_term
             or term is self._root_mask_dates_term
         )
+
+    def _resolve_hooks(self, hooks):
+        """
+        """
+        return MultiHook(list(hooks) + self._default_hooks)
